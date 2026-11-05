@@ -59,8 +59,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
 
             mode = new Mode[NumberOfPins];
+            outputType = new OutputType[NumberOfPins];
             outputState = new bool[NumberOfPins];
             externalState = new bool[NumberOfPins];
+            externallyDriven = new bool[NumberOfPins];
             outputSpeed = new OutputSpeed[NumberOfPins];
             pullUpPullDown = new PullUpPullDown[NumberOfPins];
 
@@ -85,6 +87,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             registers.Reset();
 
             Array.Clear(outputState, 0, outputState.Length);
+            Array.Clear(outputType, 0, outputType.Length);
             lockedPins = 0;
             lockSequenceState = LockSequence.Idle;
 
@@ -116,7 +119,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
 
             externalState[number] = value;
-            if(mode[number] == Mode.Input || mode[number] == Mode.AlternateFunction)
+            externallyDriven[number] = true;
+            if(mode[number] == Mode.Input || mode[number] == Mode.AlternateFunction || IsReleased(number))
             {
                 WritePin(number, value);
             }
@@ -146,13 +150,43 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 var state = ((value & 1u) == 1);
                 // The output latch is writable in every mode, but only drives the pin in output mode.
                 outputState[i] = state;
-                if(mode[i] == Mode.Output)
-                {
-                    WritePin(i, state);
-                }
+                UpdateOutputPin(i);
 
                 value >>= 1;
             }
+        }
+
+        private void UpdateOutputPin(int number)
+        {
+            if(mode[number] == Mode.Output)
+            {
+                WritePin(number, OutputLevel(number));
+            }
+        }
+
+        private bool OutputLevel(int number)
+        {
+            return IsReleased(number) ? ReleasedLevel(number) : outputState[number];
+        }
+
+        private bool IsReleased(int number)
+        {
+            // An open-drain output only drives low: a 1 in the latch leaves the pin in Hi-Z,
+            // and IDR samples the level the external circuit sets (RM0090, GPIO output configuration).
+            return mode[number] == Mode.Output && outputType[number] == OutputType.OpenDrain && outputState[number];
+        }
+
+        private bool ReleasedLevel(int number)
+        {
+            if(externallyDriven[number])
+            {
+                return externalState[number];
+            }
+            // Nothing outside the port has driven the line yet. An open-drain line needs a pull-up to
+            // work, internal or on the board, so it reads high unless the internal pull-down is selected.
+            // Without the pull-down this is also the level the pin had before OTYPER was modelled, so
+            // platforms that connect nothing to the pin see no change.
+            return pullUpPullDown[number] != PullUpPullDown.Down;
         }
 
         private void ChangeMode(int number, Mode newMode)
@@ -172,7 +206,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 // or external input should not be applied for them.
                 return;
             }
-            WritePin(number, newMode == Mode.Output ? outputState[number] : externalState[number]);
+            WritePin(number, newMode == Mode.Output ? OutputLevel(number) : externalState[number]);
         }
 
         private void GuardPinAction(int number, string name, Action action)
@@ -195,22 +229,13 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                         changeCallback: (idx, _, val) => GuardPinAction(idx, "MODER", () => ChangeMode(idx, val)))
                 },
                 {(long)Registers.OutputType, new DoubleWordRegister(this)
-                    .WithTaggedFlag("OT0", 0)
-                    .WithTaggedFlag("OT1", 1)
-                    .WithTaggedFlag("OT2", 2)
-                    .WithTaggedFlag("OT3", 3)
-                    .WithTaggedFlag("OT4", 4)
-                    .WithTaggedFlag("OT5", 5)
-                    .WithTaggedFlag("OT6", 6)
-                    .WithTaggedFlag("OT7", 7)
-                    .WithTaggedFlag("OT8", 8)
-                    .WithTaggedFlag("OT9", 9)
-                    .WithTaggedFlag("OT10", 10)
-                    .WithTaggedFlag("OT11", 11)
-                    .WithTaggedFlag("OT12", 12)
-                    .WithTaggedFlag("OT13", 13)
-                    .WithTaggedFlag("OT14", 14)
-                    .WithTaggedFlag("OT15", 15)
+                    .WithEnumFields<DoubleWordRegister, OutputType>(0, 1, NumberOfPins, name: "OTYPER",
+                        valueProviderCallback: (idx, _) => outputType[idx],
+                        changeCallback: (idx, _, val) => GuardPinAction(idx, "OTYPER", () =>
+                        {
+                            outputType[idx] = val;
+                            UpdateOutputPin(idx);
+                        }))
                     .WithReservedBits(16, 16)
                 },
                 {(long)Registers.OutputSpeed, new DoubleWordRegister(this)
@@ -221,7 +246,11 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 {(long)Registers.PullUpPullDown, new DoubleWordRegister(this)
                     .WithEnumFields<DoubleWordRegister, PullUpPullDown>(0, 2, NumberOfPins, name: "PUPDR0",
                         valueProviderCallback: (idx, _) => pullUpPullDown[idx],
-                        changeCallback: (idx, _, val) => GuardPinAction(idx, "PUPDR0", () => pullUpPullDown[idx] = val))
+                        changeCallback: (idx, _, val) => GuardPinAction(idx, "PUPDR0", () =>
+                        {
+                            pullUpPullDown[idx] = val;
+                            UpdateOutputPin(idx);
+                        }))
                 },
                 {(long)Registers.InputData, new DoubleWordRegister(this)
                     .WithValueField(0, 16, FieldMode.Read, valueProviderCallback: _ => BitHelper.GetValueFromBitsArray(State), name: "IDR")
@@ -324,8 +353,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private LockSequence lockSequenceState;
 
         private readonly Mode[] mode;
+        private readonly OutputType[] outputType;
         private readonly bool[] outputState;
         private readonly bool[] externalState;
+        private readonly bool[] externallyDriven;
         private readonly OutputSpeed[] outputSpeed;
         private readonly PullUpPullDown[] pullUpPullDown;
         private readonly HashSet<InvertedAFPin> invertedAFPins = new HashSet<InvertedAFPin>();
@@ -427,6 +458,12 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             Output            = 0x1,
             AlternateFunction = 0x2,
             AnalogMode        = 0x3,
+        }
+
+        private enum OutputType
+        {
+            PushPull  = 0x0,
+            OpenDrain = 0x1,
         }
 
         private enum OutputSpeed
