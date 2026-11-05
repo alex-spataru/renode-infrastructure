@@ -224,9 +224,13 @@ namespace Antmicro.Renode.Peripherals.DMA
                 channelNumber = number;
 
                 var registersMap = new Dictionary<long, DoubleWordRegister>();
+                // EN reads back as written. A software-started transfer (memory-to-memory or
+                // memory-to-peripheral) starts only when EN changes from 0 to 1, so that
+                // a read-modify-write of CCR with EN kept set (e.g. HAL_DMA_IRQHandler
+                // disabling HTIE) does not start it again.
                 registersMap.Add((long)ChannelRegisters.ChannelConfiguration + (number * ShiftBetweenChannels), new DoubleWordRegister(parent)
                     .WithFlag(0, out channelEnable,
-                        writeCallback: (_, val) =>
+                        changeCallback: (_, val) =>
                         {
                             if(!val)
                             {
@@ -237,7 +241,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                                 DoTransfer();
                             }
                         },
-                        valueProviderCallback: _ => false, name: "Channel enable (EN)")
+                        name: "Channel enable (EN)")
                     .WithFlag(1, out transferCompleteInterruptEnable, name: "Transfer complete interrupt enable (TCIE)")
                     .WithFlag(2, out halfTransferInterruptEnable, name: "Half transfer interrupt enable (HTIE)")
                     .WithTag("Transfer error interrupt enable (TEIE)", 3, 1)
